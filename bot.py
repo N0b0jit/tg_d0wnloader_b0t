@@ -139,18 +139,20 @@ async def download_media(url: str, is_audio_only: bool = False) -> Tuple[Optiona
         'no_warnings': True,
         'nocheckcertificate': True,
         'geo_bypass': True,
-        'retries': 3,
-        'fragment_retries': 3,
+        'retries': 5,
+        'fragment_retries': 10,
+        'extractor_retries': 5,
+        'file_access_retries': 5,
+        'socket_timeout': 60,
         'force_ipv4': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['ios', 'android', 'web'],
-                'player_skip': ['webpage', 'configs'],
+                'player_client': ['android', 'ios', 'mweb', 'tv'],
             }
         },
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'format': 'bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[vcodec^=avc1][acodec^=mp4a]/best[ext=mp4]/best',
         'http_headers': {
-             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
              'Accept-Language': 'en-US,en;q=0.9',
              'Sec-Fetch-Mode': 'navigate',
@@ -195,8 +197,13 @@ async def download_media(url: str, is_audio_only: bool = False) -> Tuple[Optiona
         logger.error(f"Download error: {error_str}")
         
         custom_error = "❌ Failed to download media."
-        if "confirm you're not a bot" in error_str:
-            custom_error = "❌ YouTube bot detection blocked the download. Please use cookies to fix this."
+        if "confirm you're not a bot" in error_str or "Sign in to confirm you're not a bot" in error_str:
+            custom_error = (
+                "❌ YouTube bot detection blocked the download.\n\n"
+                "To fix this:\n"
+                "1. Export your YouTube cookies as `cookies.txt` and place them in the bot folder.\n"
+                "2. Ensure you are using the latest version of yt-dlp."
+            )
         elif "Private video" in error_str:
             custom_error = "❌ This video is private."
         elif "Login required" in error_str:
