@@ -6,6 +6,8 @@ from typing import Dict, Tuple, Optional, Any
 from urllib.parse import urlparse
 import glob
 import uuid
+from flask import Flask
+from threading import Thread
 
 from dotenv import load_dotenv
 from telegram import (
@@ -43,6 +45,21 @@ if not os.path.exists(DOWNLOAD_DIR):
 # --- In-Memory Verification Storage (Reset on restart) ---
 VERIFIED_USERS = set()
 URL_CACHE = {}
+
+# --- Keep Alive Server for Render ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "I'm alive"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run_flask)
+    t.start()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -352,6 +369,13 @@ def main():
         print("Error: BOT_TOKEN not found in .env file.")
         return
 
+    # Write cookies from ENV if available (for cloud hosting)
+    cookies_content = os.getenv("COOKIES_CONTENT")
+    if cookies_content:
+        with open("cookies.txt", "w") as f:
+            f.write(cookies_content)
+
+
     # Increase global timeouts
     from telegram.request import HTTPXRequest
     request = HTTPXRequest(connection_pool_size=8, read_timeout=120, write_timeout=120, connect_timeout=60)
@@ -364,6 +388,7 @@ def main():
     
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
+    keep_alive()
     print("Bot is running...")
     application.run_polling()
 
