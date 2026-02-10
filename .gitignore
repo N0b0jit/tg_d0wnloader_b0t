@@ -1,0 +1,14 @@
+
+# Environment Variables
+.env
+
+# Dependencies
+venv/
+__pycache__/
+
+# Downloads
+downloads/
+
+# Temporary Files
+temp_vidzilla/
+cookies.txt

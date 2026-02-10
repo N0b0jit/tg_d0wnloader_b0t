@@ -1,0 +1,371 @@
+
+import os
+import logging
+import asyncio
+from typing import Dict, Tuple, Optional, Any
+from urllib.parse import urlparse
+import glob
+import uuid
+
+from dotenv import load_dotenv
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaVideo,
+    InputMediaAudio,
+    InputMediaDocument
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+)
+import yt_dlp
+
+# --- Load Environment ---
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+REQUIRED_CHANNEL_ID = os.getenv("REQUIRED_CHANNEL_ID")
+
+# --- Configuration ---
+LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+logger = logging.getLogger(__name__)
+
+DOWNLOAD_DIR = "downloads"
+if not os.path.exists(DOWNLOAD_DIR):
+    os.makedirs(DOWNLOAD_DIR)
+
+# --- In-Memory Verification Storage (Reset on restart) ---
+VERIFIED_USERS = set()
+URL_CACHE = {}
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    # Check if user is already verified (clicked the button previously)
+    if user.id in VERIFIED_USERS:
+        await update.message.reply_text(
+            f"Welcome back, {user.first_name}! 👋\n\n"
+            "✅ You are verified.\n"
+            "Send me a link from Instagram, TikTok, YouTube, or Facebook to start downloading!",
+            parse_mode='Markdown'
+        )
+        return
+
+    welcome_message = (
+        f"Hello {user.first_name}! 👋\n\n"
+        "To use the **Universal Media Downloader Bot**, you must **Subscribe & Follow** our official channels:\n\n"
+        "1️⃣ **Subscribe** to YouTube\n"
+        "2️⃣ **Follow** on Instagram & TikTok\n"
+        "3️⃣ **Follow** on Facebook\n\n"
+        "👇 Click the buttons below to follow, then click **'✅ I Have Subscribed'** to unlock the bot."
+    )
+    
+    # Social Media Links
+    social_buttons = [
+        [InlineKeyboardButton("YouTube", url="https://www.youtube.com/@NobojitNexus"),
+         InlineKeyboardButton("Instagram", url="https://www.instagram.com/mr_nobojit.m")],
+        [InlineKeyboardButton("TikTok", url="https://www.tiktok.com/@nobojitnexus"),
+         InlineKeyboardButton("Facebook", url="https://www.facebook.com")] 
+    ]
+    
+    keyboard = []
+    keyboard.extend(social_buttons)
+    # The "Verification" button
+    keyboard.append([InlineKeyboardButton("✅ I Have Subscribed", callback_data="verify_socials")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(welcome_message, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def verify_socials_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    # "Simulate" verification (since we can't actually check external follows via API easily)
+    VERIFIED_USERS.add(user_id)
+    
+    await query.answer("Verification Successful!")
+    
+    await query.edit_message_text(
+        "🎉 **Verification Successful!**\n\n"
+        "Thank you for subscribing! You now have full access.\n"
+        "**Send me a link** to start downloading.",
+        parse_mode='Markdown'
+    )
+
+# --- Media Processing Logic ---
+def get_platform(url: str) -> str:
+    domain = urlparse(url).netloc.lower()
+    if 'instagram' in domain: return 'Instagram'
+    if 'tiktok' in domain: return 'TikTok'
+    if 'youtube' in domain or 'youtu.be' in domain: return 'YouTube'
+    if 'facebook' in domain or 'fb.watch' in domain: return 'Facebook'
+    if 'pinterest' in domain: return 'Pinterest'
+    if 'twitter' in domain or 'x.com' in domain: return 'Twitter'
+    return 'Unknown'
+
+async def download_media(url: str, is_audio_only: bool = False) -> Tuple[Optional[str], Optional[Dict]]:
+    """
+    Downloads media using yt-dlp. Returns the path to the file and metadata.
+    """
+    # Check for cookies.txt
+    cookies_path = 'cookies.txt'
+    use_cookies = os.path.exists(cookies_path)
+
+    # Robust options based on Vidzilla
+    ydl_opts = {
+        'outtmpl': f'{DOWNLOAD_DIR}/%(title).100s.%(ext)s', 
+        'quiet': True,
+        'no_warnings': True,
+        'nocheckcertificate': True, # Ignore SSL errors
+        'geo_bypass': True,
+        'retries': 3,
+        'fragment_retries': 3,
+        'force_ipv4': True, # Avoid IPv6 blocks
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web'],
+                'player_skip': ['webpage', 'configs'],
+            }
+        },
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'http_headers': {
+             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+             'Accept-Language': 'en-US,en;q=0.9',
+             'Sec-Fetch-Mode': 'navigate',
+        }
+    }
+
+    if is_audio_only:
+        ydl_opts.update({
+            'format': 'bestaudio/best',
+            'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}],
+        })
+
+    try:
+        loop = asyncio.get_event_loop()
+        def run_ydl():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                if url.startswith("ytsearch"):
+                    info = ydl.extract_info(url, download=False)
+                    if 'entries' in info and len(info['entries']) > 0:
+                        first_entry = info['entries'][0]
+                        real_url = first_entry['webpage_url']
+                        info = ydl.extract_info(real_url, download=True)
+                    else:
+                        raise Exception("No search results found.")
+                else:
+                    info = ydl.extract_info(url, download=True)
+                
+                filename = ydl.prepare_filename(info)
+                if is_audio_only:
+                    base, _ = os.path.splitext(filename)
+                    filename = base + ".mp3"
+                return filename, info
+        
+        return await loop.run_in_executor(None, run_ydl)
+
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        return None, None
+
+async def handle_song_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query_text = update.message.text
+    status_msg = await update.message.reply_text(f"🔎 Searching for '{query_text}'...")
+
+    search_url = f"ytsearch1:{query_text}"
+    
+    try:
+        file_path, info = await download_media(search_url, is_audio_only=True)
+        
+        if file_path and os.path.exists(file_path):
+             await status_msg.edit_text("📤 Found! Uploading...")
+             
+             # Extract title/uploader safely
+             if 'entries' in info: 
+                 info = info['entries'][0]
+                 
+             title = info.get('title', query_text)
+             uploader = info.get('uploader', 'Unknown')
+
+             with open(file_path, 'rb') as f:
+                await update.message.reply_audio(
+                    audio=f,
+                    title=title,
+                    performer=uploader,
+                    caption=f"🎵 **{title}**\nMatches: {query_text}",
+                    parse_mode='Markdown'
+                )
+             os.remove(file_path)
+             await status_msg.delete()
+        else:
+             await status_msg.edit_text("❌ No results found or download failed.")
+
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        await status_msg.edit_text(f"An error occurred during search: {str(e)}")
+
+async def handle_mp3_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Converting...")
+    
+    try:
+        data_parts = query.data.split("|", 1)
+        if len(data_parts) < 2:
+            return
+        _, url_id = data_parts
+        
+        # Look up URL from cache
+        url = URL_CACHE.get(url_id)
+        if not url:
+             await query.message.reply_text("❌ Link expired. Please search again.")
+             return
+        
+        status_msg = await query.message.reply_text("⏳ Converting audio...")
+        
+        file_path, info = await download_media(url, is_audio_only=True)
+        
+        if file_path and os.path.exists(file_path):
+            await status_msg.edit_text("📤 Uploading Audio...")
+            title = info.get('title', 'Audio')
+            with open(file_path, 'rb') as f:
+                await query.message.reply_audio(
+                    audio=f,
+                    title=title,
+                    performer=info.get('uploader', 'Unknown'),
+                    caption=f"🎵 **{title}**",
+                    parse_mode='Markdown'
+                )
+            os.remove(file_path)
+            await status_msg.delete()
+        else:
+             await status_msg.edit_text("❌ Failed to convert audio.")
+
+    except Exception as e:
+        logger.error(f"Error converting MP3: {e}")
+        # Need to check context for reply if status_msg exist
+        if 'status_msg' in locals():
+            await status_msg.edit_text(f"Error converting audio: {str(e)}")
+
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message or not message.text:
+            return
+    url = message.text.strip()
+    user = message.from_user
+    
+    # 1. Verify Membership (Socials Gatekeeper)
+    if user.id not in VERIFIED_USERS:
+        await message.reply_text(
+            "🔒 **Access Denied**\n"
+            "Please run /start and follow our social media accounts to unlock the bot.",
+            parse_mode='Markdown'
+        )
+        return
+
+    # 2. Detect Platform
+    platform = get_platform(url)
+    logger.info(f"User {user.first_name} requested {platform} link: {url}")
+
+    if platform == 'Unknown' and not (url.startswith('http') or url.startswith('www')):
+        await handle_song_search(update, context)
+        return
+        
+    status_msg = await message.reply_text(f"⏳ Processing link from {platform}...")
+
+    # 3. Download
+    try:
+        logger.info("Starting download...")
+        file_path, info = await download_media(url, is_audio_only=False)
+        
+        if not file_path or not os.path.exists(file_path):
+            logger.error("Download failed or file not found.")
+            await status_msg.edit_text("❌ Failed to download media. The link might be private or invalid.")
+            return
+
+        title = info.get('title', 'Media')
+        file_size = os.path.getsize(file_path) / (1024 * 1024) # MB
+        logger.info(f"Download success. File: {file_path}, Size: {file_size:.2f}MB")
+        
+        # 4. Upload
+        if file_size > 50:
+            await status_msg.edit_text(f"❌ File is too large ({file_size:.2f}MB). Telegram bot limit is 50MB.")
+            os.remove(file_path)
+            return
+
+        await status_msg.edit_text("📤 Uploading...")
+        
+        # Determine URL for callback - use cache for long URLs
+        # Generate short ID
+        url_id = str(uuid.uuid4())[:8]
+        URL_CACHE[url_id] = url
+        
+        # Determine file type
+        file_ext = os.path.splitext(file_path)[1].lower()
+        is_video = file_ext not in ['.jpg', '.jpeg', '.png', '.webp']
+
+        with open(file_path, 'rb') as f:
+            keyboard = []
+            # Only show MP3 conversion for videos
+            if is_video:
+                 keyboard.append([InlineKeyboardButton("Download as MP3", callback_data=f"convert_mp3|{url_id}")])
+            
+            reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+
+            # Set explicit long timeout for upload
+            if is_video:
+                await message.reply_video(
+                    video=f,
+                    caption=f"🎥 {title}\nDownloaded via Universal Bot",
+                    reply_markup=reply_markup,
+                    supports_streaming=True,
+                    read_timeout=120, 
+                    write_timeout=120,
+                    connect_timeout=60
+                )
+            else:
+                 await message.reply_photo(
+                    photo=f,
+                    caption=f"📸 {title}\nDownloaded via Universal Bot",
+                    reply_markup=reply_markup,
+                    read_timeout=120, 
+                    write_timeout=120,
+                    connect_timeout=60
+                )
+            
+        os.remove(file_path)
+        await status_msg.delete()
+        logger.info("Upload completed.")
+
+    except Exception as e:
+        logger.error(f"Error handling URL: {e}")
+        await status_msg.edit_text(f"An error occurred: {str(e)}")
+
+def main():
+    if not BOT_TOKEN:
+        print("Error: BOT_TOKEN not found in .env file.")
+        return
+
+    # Increase global timeouts
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(connection_pool_size=8, read_timeout=120, write_timeout=120, connect_timeout=60)
+
+    application = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(verify_socials_callback, pattern="^verify_socials$"))
+    application.add_handler(CallbackQueryHandler(handle_mp3_conversion, pattern=r"^convert_mp3\|"))
+    
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+
+    print("Bot is running...")
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
