@@ -126,27 +126,25 @@ def get_platform(url: str) -> str:
     if 'twitter' in domain or 'x.com' in domain: return 'Twitter'
     return 'Unknown'
 
-async def download_media(url: str, is_audio_only: bool = False) -> Tuple[Optional[str], Optional[Dict]]:
+async def download_media(url: str, is_audio_only: bool = False) -> Tuple[Optional[str], Optional[Dict], Optional[str]]:
     """
-    Downloads media using yt-dlp. Returns the path to the file and metadata.
+    Downloads media using yt-dlp. Returns (file_path, info, error_message).
     """
-    # Check for cookies.txt
     cookies_path = 'cookies.txt'
     use_cookies = os.path.exists(cookies_path)
 
-    # Robust options based on Vidzilla
     ydl_opts = {
         'outtmpl': f'{DOWNLOAD_DIR}/%(title).100s.%(ext)s', 
         'quiet': True,
         'no_warnings': True,
-        'nocheckcertificate': True, # Ignore SSL errors
+        'nocheckcertificate': True,
         'geo_bypass': True,
         'retries': 3,
         'fragment_retries': 3,
-        'force_ipv4': True, # Avoid IPv6 blocks
+        'force_ipv4': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web'],
+                'player_client': ['ios', 'android', 'web'],
                 'player_skip': ['webpage', 'configs'],
             }
         },
@@ -158,6 +156,10 @@ async def download_media(url: str, is_audio_only: bool = False) -> Tuple[Optiona
              'Sec-Fetch-Mode': 'navigate',
         }
     }
+
+    if use_cookies:
+        ydl_opts['cookiefile'] = cookies_path
+        logger.info("Using cookies for download.")
 
     if is_audio_only:
         ydl_opts.update({
@@ -184,13 +186,23 @@ async def download_media(url: str, is_audio_only: bool = False) -> Tuple[Optiona
                 if is_audio_only:
                     base, _ = os.path.splitext(filename)
                     filename = base + ".mp3"
-                return filename, info
+                return filename, info, None
         
         return await loop.run_in_executor(None, run_ydl)
 
     except Exception as e:
-        logger.error(f"Download error: {e}")
-        return None, None
+        error_str = str(e)
+        logger.error(f"Download error: {error_str}")
+        
+        custom_error = "❌ Failed to download media."
+        if "confirm you're not a bot" in error_str:
+            custom_error = "❌ YouTube bot detection blocked the download. Please use cookies to fix this."
+        elif "Private video" in error_str:
+            custom_error = "❌ This video is private."
+        elif "Login required" in error_str:
+            custom_error = "❌ Login required to view this content."
+            
+        return None, None, custom_error
 
 async def handle_song_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query_text = update.message.text
@@ -199,7 +211,7 @@ async def handle_song_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
     search_url = f"ytsearch1:{query_text}"
     
     try:
-        file_path, info = await download_media(search_url, is_audio_only=True)
+        file_path, info, error_msg = await download_media(search_url, is_audio_only=True)
         
         if file_path and os.path.exists(file_path):
              await status_msg.edit_text("📤 Found! Uploading...")
@@ -222,7 +234,7 @@ async def handle_song_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
              os.remove(file_path)
              await status_msg.delete()
         else:
-             await status_msg.edit_text("❌ No results found or download failed.")
+             await status_msg.edit_text(error_msg or "❌ No results found or download failed.")
 
     except Exception as e:
         logger.error(f"Search error: {e}")
@@ -246,7 +258,7 @@ async def handle_mp3_conversion(update: Update, context: ContextTypes.DEFAULT_TY
         
         status_msg = await query.message.reply_text("⏳ Converting audio...")
         
-        file_path, info = await download_media(url, is_audio_only=True)
+        file_path, info, error_msg = await download_media(url, is_audio_only=True)
         
         if file_path and os.path.exists(file_path):
             await status_msg.edit_text("📤 Uploading Audio...")
@@ -262,7 +274,7 @@ async def handle_mp3_conversion(update: Update, context: ContextTypes.DEFAULT_TY
             os.remove(file_path)
             await status_msg.delete()
         else:
-             await status_msg.edit_text("❌ Failed to convert audio.")
+             await status_msg.edit_text(error_msg or "❌ Failed to convert audio.")
 
     except Exception as e:
         logger.error(f"Error converting MP3: {e}")
@@ -299,11 +311,11 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3. Download
     try:
         logger.info("Starting download...")
-        file_path, info = await download_media(url, is_audio_only=False)
+        file_path, info, error_msg = await download_media(url, is_audio_only=False)
         
         if not file_path or not os.path.exists(file_path):
             logger.error("Download failed or file not found.")
-            await status_msg.edit_text("❌ Failed to download media. The link might be private or invalid.")
+            await status_msg.edit_text(error_msg or "❌ Failed to download media. The link might be private or invalid.")
             return
 
         title = info.get('title', 'Media')
@@ -372,6 +384,26 @@ def main():
     # Write cookies from ENV if available (for cloud hosting)
     cookies_content = os.getenv("COOKIES_CONTENT")
     if cookies_content:
+        # Detect if it's JSON and convert to Netscape format
+        if cookies_content.strip().startswith("[") and cookies_content.strip().endswith("]"):
+            try:
+                import json
+                cookies = json.loads(cookies_content)
+                netscape_text = "# Netscape HTTP Cookie File\n"
+                for c in cookies:
+                    domain = c.get('domain', '')
+                    include_subdomains = "TRUE" if domain.startswith('.') else "FALSE"
+                    path = c.get('path', '/')
+                    secure = "TRUE" if c.get('secure') else "FALSE"
+                    expiry = int(c.get('expirationDate', 0))
+                    name = c.get('name', '')
+                    value = c.get('value', '')
+                    netscape_text += f"{domain}\t{include_subdomains}\t{path}\t{secure}\t{expiry}\t{name}\t{value}\n"
+                cookies_content = netscape_text
+                logger.info("Detected JSON cookies. Converted to Netscape format successfully.")
+            except Exception as e:
+                logger.error(f"Error converting JSON cookies: {e}")
+
         with open("cookies.txt", "w") as f:
             f.write(cookies_content)
 
