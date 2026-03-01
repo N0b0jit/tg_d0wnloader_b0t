@@ -290,7 +290,7 @@ async def download_media(url: str, is_audio_only: bool = False) -> Tuple[Optiona
 LANGUAGE_ATTEMPTS = [
     ("hi-IN",  "Hindi",      sanscript.DEVANAGARI),
     ("bn-IN",  "Bengali",    sanscript.BENGALI),
-    ("ur-PK",  "Urdu",       sanscript.SHARADA),
+    ("ur-PK",  "Urdu",       sanscript.ARABIC),
     ("mr-IN",  "Marathi",    sanscript.DEVANAGARI),
     ("gu-IN",  "Gujarati",   sanscript.GUJARATI),
     ("pa-IN",  "Punjabi",    sanscript.GURMUKHI),
