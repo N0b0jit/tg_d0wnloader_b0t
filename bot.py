@@ -8,6 +8,8 @@ import glob
 import uuid
 from flask import Flask
 from threading import Thread
+import speech_recognition as sr
+import subprocess
 
 from dotenv import load_dotenv
 from telegram import (
@@ -211,6 +213,33 @@ async def download_media(url: str, is_audio_only: bool = False) -> Tuple[Optiona
             
         return None, None, custom_error
 
+async def generate_transcript(video_path: str) -> Optional[str]:
+    """Extracts a 60-second transcript from a video file."""
+    loop = asyncio.get_event_loop()
+    def transcribe():
+        wav_path = video_path + ".wav"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", video_path, "-ac", "1", "-ar", "16000", wav_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+            )
+            recognizer = sr.Recognizer()
+            with sr.AudioFile(wav_path) as source:
+                audio = recognizer.record(source, duration=60) # Limit to 60s
+            text = recognizer.recognize_google(audio)
+            return text
+        except sr.UnknownValueError:
+            return "Could not detect speech in the video."
+        except sr.RequestError as e:
+            return f"Error from recognition service: {e}"
+        except Exception as e:
+            logger.error(f"Transcription error: {e}")
+            return None
+        finally:
+            if os.path.exists(wav_path):
+                os.remove(wav_path)
+    return await loop.run_in_executor(None, transcribe)
+
 async def handle_song_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query_text = update.message.text
     status_msg = await update.message.reply_text(f"🔎 Searching for '{query_text}'...")
@@ -346,6 +375,13 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_ext = os.path.splitext(file_path)[1].lower()
         is_video = file_ext not in ['.jpg', '.jpeg', '.png', '.webp']
 
+        transcript_text = None
+        if is_video:
+            await status_msg.edit_text("🗣️ Generating transcript...")
+            transcript_text = await generate_transcript(file_path)
+
+        await status_msg.edit_text("📤 Uploading...")
+        
         with open(file_path, 'rb') as f:
             keyboard = []
             # Only show MP3 conversion for videos
@@ -365,6 +401,25 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     write_timeout=120,
                     connect_timeout=60
                 )
+                
+                # Upload transcript if available
+                if transcript_text and transcript_text != "Could not detect speech in the video.":
+                    transcript_filename = f"{DOWNLOAD_DIR}/transcript_{url_id}.txt"
+                    try:
+                        with open(transcript_filename, "w", encoding="utf-8") as tf:
+                            tf.write(f"Transcript for {title}:\n\n{transcript_text}")
+                        with open(transcript_filename, "rb") as tf:
+                            await message.reply_document(
+                                document=tf,
+                                filename=f"Transcript.txt",
+                                caption="📝 Auto-generated Transcript"
+                            )
+                    except Exception as e:
+                        logger.error(f"Error sending transcript: {e}")
+                    finally:
+                        if os.path.exists(transcript_filename):
+                            os.remove(transcript_filename)
+                            
             else:
                  await message.reply_photo(
                     photo=f,

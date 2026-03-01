@@ -4,3 +4,4 @@ python-dotenv
 requests
 ffmpeg-python
 flask
+SpeechRecognition
