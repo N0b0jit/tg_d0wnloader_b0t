@@ -219,25 +219,34 @@ async def generate_transcript(video_path: str) -> Optional[str]:
     def transcribe():
         wav_path = video_path + ".wav"
         try:
-            subprocess.run(
+            logger.info(f"[Transcript] Starting FFmpeg audio extraction for: {video_path}")
+            result = subprocess.run(
                 ["ffmpeg", "-y", "-i", video_path, "-ac", "1", "-ar", "16000", wav_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
+            if result.returncode != 0:
+                logger.error(f"[Transcript] FFmpeg failed: {result.stderr.decode('utf-8', errors='replace')}")
+                return None
+            logger.info("[Transcript] FFmpeg done. Sending to Google Speech-to-Text...")
             recognizer = sr.Recognizer()
             with sr.AudioFile(wav_path) as source:
-                audio = recognizer.record(source, duration=60) # Limit to 60s
+                audio = recognizer.record(source, duration=60)
             text = recognizer.recognize_google(audio)
+            logger.info(f"[Transcript] Success: {text[:80]}")
             return text
         except sr.UnknownValueError:
-            return "Could not detect speech in the video."
+            logger.warning("[Transcript] No speech detected in video.")
+            return "[No speech detected in this video]"
         except sr.RequestError as e:
-            return f"Error from recognition service: {e}"
+            logger.error(f"[Transcript] Google Speech API error: {e}")
+            return f"[Speech API error: {e}]"
         except Exception as e:
-            logger.error(f"Transcription error: {e}")
+            logger.error(f"[Transcript] Unexpected error: {e}")
             return None
         finally:
             if os.path.exists(wav_path):
                 os.remove(wav_path)
+                logger.info("[Transcript] Cleaned up WAV file.")
     return await loop.run_in_executor(None, transcribe)
 
 async def handle_song_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -375,62 +384,64 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_ext = os.path.splitext(file_path)[1].lower()
         is_video = file_ext not in ['.jpg', '.jpeg', '.png', '.webp']
 
+        # --- Generate transcript BEFORE opening file for upload ---
         transcript_text = None
         if is_video:
             await status_msg.edit_text("🗣️ Generating transcript...")
             transcript_text = await generate_transcript(file_path)
+            logger.info(f"[Transcript] Result: {transcript_text}")
 
         await status_msg.edit_text("📤 Uploading...")
-        
-        with open(file_path, 'rb') as f:
-            keyboard = []
-            # Only show MP3 conversion for videos
-            if is_video:
-                 keyboard.append([InlineKeyboardButton("Download as MP3", callback_data=f"convert_mp3|{url_id}")])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
 
-            # Set explicit long timeout for upload
-            if is_video:
+        keyboard = []
+        if is_video:
+            keyboard.append([InlineKeyboardButton("Download as MP3", callback_data=f"convert_mp3|{url_id}")])
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+
+        # --- Upload video/photo (separate file handle, closed after) ---
+        if is_video:
+            with open(file_path, 'rb') as f:
                 await message.reply_video(
                     video=f,
                     caption=f"🎥 {title}\nDownloaded via Universal Bot",
                     reply_markup=reply_markup,
                     supports_streaming=True,
-                    read_timeout=120, 
+                    read_timeout=120,
                     write_timeout=120,
                     connect_timeout=60
                 )
-                
-                # Upload transcript if available
-                if transcript_text and transcript_text != "Could not detect speech in the video.":
-                    transcript_filename = f"{DOWNLOAD_DIR}/transcript_{url_id}.txt"
-                    try:
-                        with open(transcript_filename, "w", encoding="utf-8") as tf:
-                            tf.write(f"Transcript for {title}:\n\n{transcript_text}")
-                        with open(transcript_filename, "rb") as tf:
-                            await message.reply_document(
-                                document=tf,
-                                filename=f"Transcript.txt",
-                                caption="📝 Auto-generated Transcript"
-                            )
-                    except Exception as e:
-                        logger.error(f"Error sending transcript: {e}")
-                    finally:
-                        if os.path.exists(transcript_filename):
-                            os.remove(transcript_filename)
-                            
-            else:
-                 await message.reply_photo(
+        else:
+            with open(file_path, 'rb') as f:
+                await message.reply_photo(
                     photo=f,
                     caption=f"📸 {title}\nDownloaded via Universal Bot",
                     reply_markup=reply_markup,
-                    read_timeout=120, 
+                    read_timeout=120,
                     write_timeout=120,
                     connect_timeout=60
                 )
-            
+
         os.remove(file_path)
+
+        # --- Send transcript AFTER video is fully uploaded and file is closed ---
+        if is_video and transcript_text:
+            transcript_filename = f"{DOWNLOAD_DIR}/transcript_{url_id}.txt"
+            try:
+                with open(transcript_filename, "w", encoding="utf-8") as tf:
+                    tf.write(f"Transcript for: {title}\n{'='*50}\n\n{transcript_text}")
+                with open(transcript_filename, "rb") as tf:
+                    await message.reply_document(
+                        document=tf,
+                        filename="Transcript.txt",
+                        caption="📝 Auto-generated Transcript"
+                    )
+                logger.info("[Transcript] Sent transcript to user.")
+            except Exception as e:
+                logger.error(f"[Transcript] Failed to send transcript file: {e}")
+            finally:
+                if os.path.exists(transcript_filename):
+                    os.remove(transcript_filename)
+
         await status_msg.delete()
         logger.info("Upload completed.")
 
