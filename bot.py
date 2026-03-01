@@ -12,8 +12,15 @@ import speech_recognition as sr
 import subprocess
 from indic_transliteration import sanscript
 from indic_transliteration.sanscript import transliterate as indic_romanize
-import git
 from datetime import datetime
+
+# Try to import git, but make it optional
+try:
+    import git
+    GIT_AVAILABLE = True
+except ImportError:
+    GIT_AVAILABLE = False
+    git = None
 
 from dotenv import load_dotenv
 from telegram import (
@@ -55,6 +62,10 @@ URL_CACHE = {}
 # --- GitHub Auto-Update Function ---
 async def auto_update_github(transcript_text: str, title: str, url_id: str):
     """Automatically commits and pushes transcript to GitHub repository."""
+    if not GIT_AVAILABLE:
+        logger.warning("[GitHub] Git not available - skipping GitHub update")
+        return False
+        
     try:
         loop = asyncio.get_event_loop()
         def github_update():
@@ -559,12 +570,15 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.info("[Transcript] Sent transcript to user.")
                 
                 # --- Auto-update GitHub with transcript ---
-                await status_msg.edit_text("🔄 Updating GitHub...")
-                github_success = await auto_update_github(transcript_text, title, url_id)
-                if github_success:
-                    logger.info("[Transcript] GitHub update successful.")
+                if GIT_AVAILABLE:
+                    await status_msg.edit_text("🔄 Updating GitHub...")
+                    github_success = await auto_update_github(transcript_text, title, url_id)
+                    if github_success:
+                        logger.info("[Transcript] GitHub update successful.")
+                    else:
+                        logger.warning("[Transcript] GitHub update failed.")
                 else:
-                    logger.warning("[Transcript] GitHub update failed.")
+                    logger.info("[Transcript] GitHub integration not available - skipping.")
                     
             except Exception as e:
                 logger.error(f"[Transcript] Failed to send transcript file: {e}")
