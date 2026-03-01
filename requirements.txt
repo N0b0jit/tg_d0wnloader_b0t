@@ -7,4 +7,6 @@ flask
 SpeechRecognition
 indic-transliteration
 GitPython
+feedparser
+schedule
 

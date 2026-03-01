@@ -2,7 +2,7 @@
 import os
 import logging
 import asyncio
-from typing import Dict, Tuple, Optional, Any
+from typing import Dict, Tuple, Optional, Any, List
 from urllib.parse import urlparse
 import glob
 import uuid
@@ -13,6 +13,10 @@ import subprocess
 from indic_transliteration import sanscript
 from indic_transliteration.sanscript import transliterate as indic_romanize
 from datetime import datetime
+import json
+import feedparser
+import schedule
+import time
 
 # Try to import git, but make it optional
 try:
@@ -58,6 +62,165 @@ if not os.path.exists(DOWNLOAD_DIR):
 # --- In-Memory Verification Storage (Reset on restart) ---
 VERIFIED_USERS = set()
 URL_CACHE = {}
+
+# --- RSS Feed Monitoring ---
+RSS_FEEDS_FILE = "rss_feeds.json"
+RSS_FEEDS = []
+PROCESSED_POSTS = set()  # Track processed posts to avoid duplicates
+ADMIN_USER_ID = None  # Will be set from environment or first user
+
+# Load RSS feeds from file
+def load_rss_feeds():
+    global RSS_FEEDS, PROCESSED_POSTS
+    try:
+        if os.path.exists(RSS_FEEDS_FILE):
+            with open(RSS_FEEDS_FILE, 'r') as f:
+                data = json.load(f)
+                RSS_FEEDS = data.get('feeds', [])
+                PROCESSED_POSTS = set(data.get('processed_posts', []))
+            logger.info(f"Loaded {len(RSS_FEEDS)} RSS feeds and {len(PROCESSED_POSTS)} processed posts")
+    except Exception as e:
+        logger.error(f"Error loading RSS feeds: {e}")
+        RSS_FEEDS = []
+        PROCESSED_POSTS = set()
+
+# Save RSS feeds to file
+def save_rss_feeds():
+    try:
+        data = {
+            'feeds': RSS_FEEDS,
+            'processed_posts': list(PROCESSED_POSTS)
+        }
+        with open(RSS_FEEDS_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+        logger.info("Saved RSS feeds configuration")
+    except Exception as e:
+        logger.error(f"Error saving RSS feeds: {e}")
+
+# --- RSS Feed Monitoring Functions ---
+async def check_rss_feeds(application):
+    """Check all RSS feeds for new content and download automatically."""
+    if not RSS_FEEDS:
+        return
+    
+    logger.info(f"Checking {len(RSS_FEEDS)} RSS feeds for new content...")
+    
+    for feed_config in RSS_FEEDS:
+        try:
+            feed_url = feed_config['url']
+            feed_name = feed_config['name']
+            
+            # Parse RSS feed
+            feed = feedparser.parse(feed_url)
+            
+            for entry in feed.entries:
+                post_id = entry.get('id', entry.get('link', ''))
+                
+                # Skip if already processed
+                if post_id in PROCESSED_POSTS:
+                    continue
+                
+                # Get the post URL
+                post_url = entry.get('link', '')
+                if not post_url:
+                    continue
+                
+                # Check if it's Instagram content
+                if 'instagram.com' in post_url:
+                    logger.info(f"[RSS] New Instagram post found: {entry.get('title', 'No title')}")
+                    
+                    # Download the content
+                    await download_and_notify(application, post_url, feed_name, entry.get('title', 'Instagram Post'))
+                    
+                    # Mark as processed
+                    PROCESSED_POSTS.add(post_id)
+                    
+        except Exception as e:
+            logger.error(f"[RSS] Error checking feed {feed_name}: {e}")
+    
+    # Save updated processed posts
+    save_rss_feeds()
+
+async def download_and_notify(application, url: str, feed_name: str, title: str):
+    """Download media and notify admin."""
+    try:
+        # Download media
+        file_path, info, error_msg = await download_media(url, is_audio_only=False)
+        
+        if file_path and os.path.exists(file_path):
+            # Send to admin
+            if ADMIN_USER_ID:
+                try:
+                    file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+                    
+                    if file_size <= 50:  # Telegram limit
+                        # Generate transcript if video
+                        transcript_text = None
+                        file_ext = os.path.splitext(file_path)[1].lower()
+                        is_video = file_ext not in ['.jpg', '.jpeg', '.png', '.webp']
+                        
+                        if is_video:
+                            transcript_text = await generate_transcript(file_path)
+                        
+                        # Send file to admin
+                        await application.bot.send_video(
+                            chat_id=ADMIN_USER_ID,
+                            video=open(file_path, 'rb'),
+                            caption=f"🤖 Auto-download from {feed_name}\n📹 {title}\n🔗 {url}",
+                            supports_streaming=True
+                        )
+                        
+                        # Send transcript if available
+                        if is_video and transcript_text:
+                            transcript_filename = f"{DOWNLOAD_DIR}/auto_transcript_{uuid.uuid4()[:8]}.txt"
+                            with open(transcript_filename, "w", encoding="utf-8") as tf:
+                                tf.write(f"Auto-transcript for: {title}\n{'='*50}\n\n{transcript_text}")
+                            
+                            await application.bot.send_document(
+                                chat_id=ADMIN_USER_ID,
+                                document=open(transcript_filename, "rb"),
+                                filename="Auto-Transcript.txt",
+                                caption="📝 Auto-generated Transcript"
+                            )
+                            
+                            os.remove(transcript_filename)
+                            
+                            # Update GitHub if available
+                            if GIT_AVAILABLE:
+                                await auto_update_github(transcript_text, title, f"auto_{uuid.uuid4()[:8]}")
+                        
+                        logger.info(f"[RSS] Successfully sent auto-download to admin: {title}")
+                    else:
+                        logger.warning(f"[RSS] File too large ({file_size:.2f}MB): {title}")
+                    
+                except Exception as e:
+                    logger.error(f"[RSS] Error sending to admin: {e}")
+                
+                # Clean up
+                os.remove(file_path)
+            else:
+                logger.warning("[RSS] No admin user ID set")
+        else:
+            logger.error(f"[RSS] Download failed: {error_msg}")
+            
+    except Exception as e:
+        logger.error(f"[RSS] Error in download_and_notify: {e}")
+
+def run_scheduler():
+    """Run the RSS feed scheduler in a separate thread."""
+    while True:
+        schedule.run_pending()
+        time.sleep(60)  # Check every minute
+
+def setup_rss_scheduler(application):
+    """Setup RSS feed monitoring schedule."""
+    # Check feeds every 15 minutes
+    schedule.every(15).minutes.do(lambda: asyncio.create_task(check_rss_feeds(application)))
+    
+    # Start scheduler thread
+    scheduler_thread = Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+    logger.info("RSS feed scheduler started (checking every 15 minutes)")
 
 # --- GitHub Auto-Update Function ---
 async def auto_update_github(transcript_text: str, title: str, url_id: str):
@@ -593,10 +756,139 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error handling URL: {e}")
         await status_msg.edit_text(f"An error occurred: {str(e)}")
 
+# --- RSS Admin Commands ---
+async def add_rss_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add RSS feed for monitoring. Usage: /add_rss <name> <rss_url>"""
+    user_id = update.effective_user.id
+    
+    # Set admin if not set (first user to use admin commands)
+    global ADMIN_USER_ID
+    if ADMIN_USER_ID is None:
+        ADMIN_USER_ID = user_id
+        logger.info(f"Set admin user ID: {ADMIN_USER_ID}")
+    
+    # Check if user is admin
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ Admin only command!")
+        return
+    
+    try:
+        args = context.args
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /add_rss <name> <rss_url>\n\nExample: /add_rss mycreator https://rss.app/feeds/xyz")
+            return
+        
+        name = args[0]
+        rss_url = args[1]
+        
+        # Validate RSS URL
+        try:
+            feed = feedparser.parse(rss_url)
+            if feed.bozo:
+                await update.message.reply_text("❌ Invalid RSS feed URL!")
+                return
+        except:
+            await update.message.reply_text("❌ Failed to parse RSS feed!")
+            return
+        
+        # Add to feeds
+        RSS_FEEDS.append({
+            'name': name,
+            'url': rss_url,
+            'added_date': datetime.now().isoformat()
+        })
+        
+        save_rss_feeds()
+        
+        await update.message.reply_text(
+            f"✅ RSS feed added successfully!\n\n"
+            f"📝 Name: {name}\n"
+            f"🔗 URL: {rss_url}\n"
+            f"⏰ Checking every 15 minutes"
+        )
+        
+        logger.info(f"[RSS] Added feed: {name} - {rss_url}")
+        
+    except Exception as e:
+        logger.error(f"[RSS] Error adding feed: {e}")
+        await update.message.reply_text("❌ Failed to add RSS feed!")
+
+async def list_rss_feeds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all RSS feeds."""
+    user_id = update.effective_user.id
+    
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ Admin only command!")
+        return
+    
+    if not RSS_FEEDS:
+        await update.message.reply_text("📭 No RSS feeds configured.")
+        return
+    
+    message = "📋 **Active RSS Feeds:**\n\n"
+    for i, feed in enumerate(RSS_FEEDS, 1):
+        message += f"{i}. **{feed['name']}**\n"
+        message += f"   🔗 {feed['url']}\n"
+        message += f"   📅 Added: {feed.get('added_date', 'Unknown')}\n\n"
+    
+    message += f"🔄 Total: {len(RSS_FEEDS)} feeds\n⏰ Checking every 15 minutes"
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def remove_rss_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove RSS feed. Usage: /remove_rss <name>"""
+    user_id = update.effective_user.id
+    
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ Admin only command!")
+        return
+    
+    try:
+        args = context.args
+        if len(args) < 1:
+            await update.message.reply_text("Usage: /remove_rss <name>")
+            return
+        
+        name = args[0]
+        
+        # Find and remove feed
+        original_count = len(RSS_FEEDS)
+        RSS_FEEDS = [feed for feed in RSS_FEEDS if feed['name'] != name]
+        
+        if len(RSS_FEEDS) < original_count:
+            save_rss_feeds()
+            await update.message.reply_text(f"✅ Removed RSS feed: {name}")
+            logger.info(f"[RSS] Removed feed: {name}")
+        else:
+            await update.message.reply_text(f"❌ RSS feed not found: {name}")
+            
+    except Exception as e:
+        logger.error(f"[RSS] Error removing feed: {e}")
+        await update.message.reply_text("❌ Failed to remove RSS feed!")
+
+async def check_rss_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually trigger RSS feed check."""
+    user_id = update.effective_user.id
+    
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ Admin only command!")
+        return
+    
+    await update.message.reply_text("🔄 Checking RSS feeds for new content...")
+    
+    # Get the application context
+    application = context.application
+    await check_rss_feeds(application)
+    
+    await update.message.reply_text("✅ RSS feed check completed!")
+
 def main():
     if not BOT_TOKEN:
         print("Error: BOT_TOKEN not found in .env file.")
         return
+
+    # Load RSS feeds on startup
+    load_rss_feeds()
 
     # Write cookies from ENV if available (for cloud hosting)
     cookies_content = os.getenv("COOKIES_CONTENT")
@@ -624,18 +916,24 @@ def main():
         with open("cookies.txt", "w") as f:
             f.write(cookies_content)
 
-
     # Increase global timeouts
     from telegram.request import HTTPXRequest
     request = HTTPXRequest(connection_pool_size=8, read_timeout=120, write_timeout=120, connect_timeout=60)
 
     application = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
 
+    # Register handlers
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("add_rss", add_rss_feed))
+    application.add_handler(CommandHandler("list_rss", list_rss_feeds))
+    application.add_handler(CommandHandler("remove_rss", remove_rss_feed))
+    application.add_handler(CommandHandler("check_rss", check_rss_now))
     application.add_handler(CallbackQueryHandler(verify_socials_callback, pattern="^verify_socials$"))
     application.add_handler(CallbackQueryHandler(handle_mp3_conversion, pattern=r"^convert_mp3\|"))
-    
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+
+    # Setup RSS scheduler
+    setup_rss_scheduler(application)
 
     keep_alive()
     print("Bot is running...")

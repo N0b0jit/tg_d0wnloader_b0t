@@ -13,5 +13,8 @@ downloads/
 temp_vidzilla/
 cookies.txt
 
+# RSS feeds configuration
+rss_feeds.json
+
 # Transcripts (we want these in git, so remove if present)
 # transcripts/
