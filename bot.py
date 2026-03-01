@@ -10,6 +10,8 @@ from flask import Flask
 from threading import Thread
 import speech_recognition as sr
 import subprocess
+from indic_transliteration import sanscript
+from indic_transliteration.sanscript import transliterate as indic_romanize
 
 from dotenv import load_dotenv
 from telegram import (
@@ -213,40 +215,88 @@ async def download_media(url: str, is_audio_only: bool = False) -> Tuple[Optiona
             
         return None, None, custom_error
 
+# --- Language detection config: (google_lang_code, display_name, indic_script or None) ---
+LANGUAGE_ATTEMPTS = [
+    ("hi-IN",  "Hindi",      sanscript.DEVANAGARI),
+    ("bn-IN",  "Bengali",    sanscript.BENGALI),
+    ("ur-PK",  "Urdu",       sanscript.SHARADA),
+    ("mr-IN",  "Marathi",    sanscript.DEVANAGARI),
+    ("gu-IN",  "Gujarati",   sanscript.GUJARATI),
+    ("pa-IN",  "Punjabi",    sanscript.GURMUKHI),
+    ("ta-IN",  "Tamil",      sanscript.TAMIL),
+    ("te-IN",  "Telugu",     sanscript.TELUGU),
+    ("kn-IN",  "Kannada",    sanscript.KANNADA),
+    ("ml-IN",  "Malayalam",  sanscript.MALAYALAM),
+    ("ar-AE",  "Arabic",     None),
+    ("en-US",  "English",    None),
+]
+
 async def generate_transcript(video_path: str) -> Optional[str]:
-    """Extracts a 60-second transcript from a video file."""
+    """Auto-detects language, transcribes, and romanizes to Hinglish/Banglish style."""
     loop = asyncio.get_event_loop()
     def transcribe():
         wav_path = video_path + ".wav"
         try:
-            logger.info(f"[Transcript] Starting FFmpeg audio extraction for: {video_path}")
+            logger.info(f"[Transcript] FFmpeg extracting audio: {video_path}")
             result = subprocess.run(
                 ["ffmpeg", "-y", "-i", video_path, "-ac", "1", "-ar", "16000", wav_path],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
             if result.returncode != 0:
-                logger.error(f"[Transcript] FFmpeg failed: {result.stderr.decode('utf-8', errors='replace')}")
+                logger.error(f"[Transcript] FFmpeg error: {result.stderr.decode('utf-8', errors='replace')}")
                 return None
-            logger.info("[Transcript] FFmpeg done. Sending to Google Speech-to-Text...")
+
             recognizer = sr.Recognizer()
             with sr.AudioFile(wav_path) as source:
                 audio = recognizer.record(source, duration=60)
-            text = recognizer.recognize_google(audio)
-            logger.info(f"[Transcript] Success: {text[:80]}")
-            return text
-        except sr.UnknownValueError:
-            logger.warning("[Transcript] No speech detected in video.")
-            return "[No speech detected in this video]"
-        except sr.RequestError as e:
-            logger.error(f"[Transcript] Google Speech API error: {e}")
-            return f"[Speech API error: {e}]"
+
+            # Try each language until one succeeds
+            for lang_code, lang_name, script in LANGUAGE_ATTEMPTS:
+                try:
+                    logger.info(f"[Transcript] Trying language: {lang_name} ({lang_code})")
+                    raw_text = recognizer.recognize_google(audio, language=lang_code)
+                    if not raw_text:
+                        continue
+                    logger.info(f"[Transcript] Detected {lang_name}: {raw_text[:80]}")
+
+                    # Romanize if it's an Indic script (Hinglish / Banglish style)
+                    if script:
+                        try:
+                            romanized = indic_romanize(raw_text, script, sanscript.ITRANS)
+                        except Exception as re:
+                            logger.warning(f"[Transcript] Romanization failed: {re}")
+                            romanized = raw_text
+                        return (
+                            f"Detected Language: {lang_name}\n"
+                            f"{'=' * 40}\n\n"
+                            f"🔤 Romanized ({lang_name}lish style):\n{romanized}\n\n"
+                            f"📜 Original Script:\n{raw_text}"
+                        )
+                    else:
+                        # Arabic or English — return as-is
+                        return (
+                            f"Detected Language: {lang_name}\n"
+                            f"{'=' * 40}\n\n"
+                            f"{raw_text}"
+                        )
+
+                except sr.UnknownValueError:
+                    logger.info(f"[Transcript] No match for {lang_name}, trying next...")
+                    continue
+                except sr.RequestError as e:
+                    logger.error(f"[Transcript] Google API error: {e}")
+                    return f"[Speech API error: {e}]"
+
+            logger.warning("[Transcript] No language matched audio.")
+            return "[Could not detect speech in any supported language]"
+
         except Exception as e:
             logger.error(f"[Transcript] Unexpected error: {e}")
             return None
         finally:
             if os.path.exists(wav_path):
                 os.remove(wav_path)
-                logger.info("[Transcript] Cleaned up WAV file.")
+                logger.info("[Transcript] WAV cleaned up.")
     return await loop.run_in_executor(None, transcribe)
 
 async def handle_song_search(update: Update, context: ContextTypes.DEFAULT_TYPE):

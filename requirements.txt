@@ -5,3 +5,5 @@ requests
 ffmpeg-python
 flask
 SpeechRecognition
+indic-transliteration
+
