@@ -12,3 +12,6 @@ downloads/
 # Temporary Files
 temp_vidzilla/
 cookies.txt
+
+# Transcripts (we want these in git, so remove if present)
+# transcripts/

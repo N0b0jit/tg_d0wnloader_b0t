@@ -12,6 +12,8 @@ import speech_recognition as sr
 import subprocess
 from indic_transliteration import sanscript
 from indic_transliteration.sanscript import transliterate as indic_romanize
+import git
+from datetime import datetime
 
 from dotenv import load_dotenv
 from telegram import (
@@ -49,6 +51,64 @@ if not os.path.exists(DOWNLOAD_DIR):
 # --- In-Memory Verification Storage (Reset on restart) ---
 VERIFIED_USERS = set()
 URL_CACHE = {}
+
+# --- GitHub Auto-Update Function ---
+async def auto_update_github(transcript_text: str, title: str, url_id: str):
+    """Automatically commits and pushes transcript to GitHub repository."""
+    try:
+        loop = asyncio.get_event_loop()
+        def github_update():
+            try:
+                # Get repository path (current directory)
+                repo_path = os.getcwd()
+                repo = git.Repo(repo_path)
+                
+                # Create transcripts directory if it doesn't exist
+                transcripts_dir = os.path.join(repo_path, "transcripts")
+                if not os.path.exists(transcripts_dir):
+                    os.makedirs(transcripts_dir)
+                
+                # Create transcript file with timestamp
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                transcript_filename = f"{timestamp}_{url_id}.txt"
+                transcript_path = os.path.join(transcripts_dir, transcript_filename)
+                
+                # Write transcript to file
+                with open(transcript_path, "w", encoding="utf-8") as f:
+                    f.write(f"Title: {title}\n")
+                    f.write(f"URL ID: {url_id}\n")
+                    f.write(f"Timestamp: {timestamp}\n")
+                    f.write(f"{'='*50}\n\n")
+                    f.write(transcript_text)
+                
+                # Git operations
+                if repo.is_dirty(untracked_files=True):
+                    repo.git.add(transcript_path)
+                    commit_message = f"Add transcript: {title[:50]}... ({timestamp})"
+                    repo.git.commit("-m", commit_message)
+                    
+                    # Push to remote
+                    origin = repo.remote(name='origin')
+                    origin.push()
+                    
+                    logger.info(f"[GitHub] Successfully pushed transcript: {transcript_filename}")
+                    return True
+                else:
+                    logger.info("[GitHub] No changes to commit")
+                    return False
+                    
+            except git.InvalidGitRepositoryError:
+                logger.error("[GitHub] Not a valid git repository")
+                return False
+            except Exception as e:
+                logger.error(f"[GitHub] Error updating repository: {e}")
+                return False
+        
+        return await loop.run_in_executor(None, github_update)
+        
+    except Exception as e:
+        logger.error(f"[GitHub] Auto-update failed: {e}")
+        return False
 
 # --- Keep Alive Server for Render ---
 app = Flask('')
@@ -237,14 +297,25 @@ async def generate_transcript(video_path: str) -> Optional[str]:
     def transcribe():
         wav_path = video_path + ".wav"
         try:
-            logger.info(f"[Transcript] FFmpeg extracting audio: {video_path}")
+            logger.info(f"[Transcript] FFmpeg extracting + filtering audio: {video_path}")
             result = subprocess.run(
-                ["ffmpeg", "-y", "-i", video_path, "-ac", "1", "-ar", "16000", wav_path],
+                [
+                    "ffmpeg", "-y", "-i", video_path,
+                    "-ac", "1", "-ar", "16000",
+                    # Speech isolation filters:
+                    # highpass=200  -> cut bass/music beats below 200Hz
+                    # lowpass=3500  -> cut high noise above 3500Hz
+                    # dynaudnorm    -> normalize quiet speech dynamically
+                    # volume=4      -> boost overall volume 4x
+                    "-af", "highpass=f=200,lowpass=f=3500,dynaudnorm,volume=4",
+                    wav_path
+                ],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
             if result.returncode != 0:
                 logger.error(f"[Transcript] FFmpeg error: {result.stderr.decode('utf-8', errors='replace')}")
                 return None
+            logger.info("[Transcript] FFmpeg audio filtering done.")
 
             recognizer = sr.Recognizer()
             with sr.AudioFile(wav_path) as source:
@@ -486,6 +557,15 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         caption="📝 Auto-generated Transcript"
                     )
                 logger.info("[Transcript] Sent transcript to user.")
+                
+                # --- Auto-update GitHub with transcript ---
+                await status_msg.edit_text("🔄 Updating GitHub...")
+                github_success = await auto_update_github(transcript_text, title, url_id)
+                if github_success:
+                    logger.info("[Transcript] GitHub update successful.")
+                else:
+                    logger.warning("[Transcript] GitHub update failed.")
+                    
             except Exception as e:
                 logger.error(f"[Transcript] Failed to send transcript file: {e}")
             finally:
